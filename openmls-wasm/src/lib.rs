@@ -4,7 +4,7 @@ use js_sys::Uint8Array;
 use openmls::{
     credentials::{BasicCredential, CredentialWithKey},
     framing::{MlsMessageBodyIn, MlsMessageIn, MlsMessageOut},
-    group::{GroupId, MlsGroup, MlsGroupJoinConfig, StagedWelcome},
+    group::{GroupId, MlsGroup, MlsGroupJoinConfig, StagedCommit, StagedWelcome},
     key_packages::KeyPackage as OpenMlsKeyPackage,
     prelude::{LeafNodeParameters, SenderRatchetConfiguration, SignatureScheme},
     treesync::RatchetTreeIn,
@@ -170,25 +170,21 @@ impl Identity {
         })
     }
 
-    pub fn key_package(&self, provider: &Provider) -> KeyPackage {
-        KeyPackage(
-            OpenMlsKeyPackage::builder()
-                .build(
-                    CIPHERSUITE,
-                    &provider.0,
-                    &self.keypair,
-                    self.credential_with_key.clone(),
-                )
-                .unwrap()
-                .key_package()
-                .clone(),
-        )
+    pub fn key_package(&self, provider: &Provider) -> Result<KeyPackage, JsError> {
+        let kp = OpenMlsKeyPackage::builder()
+            .build(
+                CIPHERSUITE,
+                &provider.0,
+                &self.keypair,
+                self.credential_with_key.clone(),
+            )
+            .map_err(|e| JsError::new(&format!("key package error: {e}")))?;
+        Ok(KeyPackage(kp.key_package().clone()))
     }
 }
 
 #[wasm_bindgen]
 pub struct AddMessages {
-    proposal: Uint8Array,
     commit: Uint8Array,
     welcome: Uint8Array,
 }
@@ -203,10 +199,6 @@ struct NativeAddMessages {
 
 #[wasm_bindgen]
 impl AddMessages {
-    #[wasm_bindgen(getter)]
-    pub fn proposal(&self) -> Uint8Array {
-        self.proposal.clone()
-    }
     #[wasm_bindgen(getter)]
     pub fn commit(&self) -> Uint8Array {
         self.commit.clone()
@@ -293,6 +285,7 @@ impl MemberInfo {
 pub struct ProcessedMessage {
     msg_type: String,
     payload: Option<Vec<u8>>,
+    staged_commit_json: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -305,20 +298,31 @@ impl ProcessedMessage {
     pub fn payload(&self) -> Option<Vec<u8>> {
         self.payload.clone()
     }
+    /// JSON describing a staged commit (only present when msg_type == "commit").
+    /// Shape: {"added_identities":[..], "removed_indices":[..], "updated_identities":[..]}.
+    /// Identity strings are UTF-8 when decodable, otherwise prefixed with "hex:".
+    /// The application MUST validate these against its policy and then call
+    /// `approve_staged_commit` to merge or `discard_staged_commit` to reject.
+    #[wasm_bindgen(getter)]
+    pub fn staged_commit_json(&self) -> Option<String> {
+        self.staged_commit_json.clone()
+    }
 }
 
 #[wasm_bindgen]
 pub struct Group {
     mls_group: MlsGroup,
+    pending_staged_commit: Option<StagedCommit>,
 }
 
 #[wasm_bindgen]
 impl Group {
-    pub fn create_new(provider: &Provider, founder: &Identity, group_id: &str) -> Group {
+    pub fn create_new(provider: &Provider, founder: &Identity, group_id: &str) -> Result<Group, JsError> {
         let group_id_bytes = group_id.bytes().collect::<Vec<_>>();
 
         let mls_group = MlsGroup::builder()
             .ciphersuite(CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
             .max_past_epochs(MAX_PAST_EPOCHS)
             .padding_size(PADDING_SIZE)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(
@@ -331,9 +335,12 @@ impl Group {
                 &founder.keypair,
                 founder.credential_with_key.clone(),
             )
-            .unwrap();
+            .map_err(|e| JsError::new(&format!("create group error: {e}")))?;
 
-        Group { mls_group }
+        Ok(Group {
+            mls_group,
+            pending_staged_commit: None,
+        })
     }
 
     pub fn join(
@@ -348,6 +355,7 @@ impl Group {
             ))),
         }?;
         let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
             .max_past_epochs(MAX_PAST_EPOCHS)
             .padding_size(PADDING_SIZE)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(
@@ -359,35 +367,32 @@ impl Group {
             StagedWelcome::new_from_welcome(&provider.0, &config, welcome, Some(ratchet_tree.0))?
                 .into_group(&provider.0)?;
 
-        Ok(Group { mls_group })
+        Ok(Group {
+            mls_group,
+            pending_staged_commit: None,
+        })
     }
 
     pub fn export_ratchet_tree(&self) -> RatchetTree {
         RatchetTree(self.mls_group.export_ratchet_tree().into())
     }
 
-    pub fn propose_and_commit_add(
+    pub fn add_member(
         &mut self,
         provider: &Provider,
         sender: &Identity,
         new_member: &KeyPackage,
     ) -> Result<AddMessages, JsError> {
-        let (proposal_msg, _proposal_ref) =
-            self.mls_group
-                .propose_add_member(provider.as_ref(), &sender.keypair, &new_member.0)?;
+        let (commit_msg, welcome_msg, _group_info) = self.mls_group.add_members(
+            provider.as_ref(),
+            &sender.keypair,
+            &[new_member.0.clone()],
+        )?;
 
-        let (commit_msg, welcome_msg, _group_info) = self
-            .mls_group
-            .commit_to_pending_proposals(&provider.0, &sender.keypair)?;
-
-        let welcome_msg = welcome_msg.ok_or(NoWelcomeError)?;
-
-        let proposal = mls_message_to_uint8array(&proposal_msg);
         let commit = mls_message_to_uint8array(&commit_msg);
         let welcome = mls_message_to_uint8array(&welcome_msg);
 
         Ok(AddMessages {
-            proposal,
             commit,
             welcome,
         })
@@ -445,6 +450,12 @@ impl Group {
             .map_err(|e| JsError::new(&format!("clear_pending_commit error: {e}")))
     }
 
+    pub fn delete(&mut self, provider: &Provider) -> Result<(), JsError> {
+        self.mls_group
+            .delete(provider.0.storage())
+            .map_err(|e| JsError::new(&format!("delete group error: {e}")))
+    }
+
     pub fn create_message(
         &mut self,
         provider: &Provider,
@@ -464,6 +475,12 @@ impl Group {
         provider: &mut Provider,
         mut msg: &[u8],
     ) -> Result<ProcessedMessage, JsError> {
+        if self.pending_staged_commit.is_some() {
+            return Err(JsError::new(
+                "previous staged commit must be approved or discarded before processing another message",
+            ));
+        }
+
         let msg = MlsMessageIn::tls_deserialize(&mut msg)?;
 
         let msg = match msg.extract() {
@@ -489,6 +506,7 @@ impl Group {
                 Ok(ProcessedMessage {
                     msg_type: "application".to_string(),
                     payload: Some(app_msg.into_bytes()),
+                    staged_commit_json: None,
                 })
             }
             openmls::framing::ProcessedMessageContent::ProposalMessage(proposal)
@@ -498,17 +516,43 @@ impl Group {
                 Ok(ProcessedMessage {
                     msg_type: "proposal".to_string(),
                     payload: None,
+                    staged_commit_json: None,
                 })
             }
             openmls::framing::ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                self.mls_group
-                    .merge_staged_commit(provider.as_mut(), *staged_commit)?;
+                let info = staged_commit_info_json(&staged_commit);
+                self.pending_staged_commit = Some(*staged_commit);
                 Ok(ProcessedMessage {
                     msg_type: "commit".to_string(),
                     payload: None,
+                    staged_commit_json: Some(info),
                 })
             }
         }
+    }
+
+    /// Merge a previously staged commit returned by `process_message`.
+    /// The application MUST validate the staged commit info against its policy
+    /// (e.g. that added members are authorised for the group) before calling this.
+    pub fn approve_staged_commit(&mut self, provider: &mut Provider) -> Result<(), JsError> {
+        let sc = self
+            .pending_staged_commit
+            .take()
+            .ok_or_else(|| JsError::new("no pending staged commit to approve"))?;
+        self.mls_group
+            .merge_staged_commit(provider.as_mut(), sc)
+            .map_err(|e| e.into())
+    }
+
+    /// Discard a staged commit without merging it. Returns Ok if there was
+    /// nothing to discard so callers can call this defensively on error paths.
+    pub fn discard_staged_commit(&mut self) -> Result<(), JsError> {
+        self.pending_staged_commit = None;
+        Ok(())
+    }
+
+    pub fn has_pending_staged_commit(&self) -> bool {
+        self.pending_staged_commit.is_some()
     }
 
     pub fn members(&self) -> Vec<MemberInfo> {
@@ -545,7 +589,10 @@ impl Group {
         let mls_group = MlsGroup::load(provider.0.storage(), &gid)
             .map_err(|e| JsError::new(&format!("group load error: {e}")))?
             .ok_or_else(|| JsError::new("group not found in storage"))?;
-        Ok(Group { mls_group })
+        Ok(Group {
+            mls_group,
+            pending_staged_commit: None,
+        })
     }
 
     pub fn export_key(
@@ -664,39 +711,13 @@ impl Group {
         provider: &mut Provider,
         msg: &[u8],
     ) -> (String, Option<Vec<u8>>) {
-        let mut reader = msg;
-        let msg = MlsMessageIn::tls_deserialize(&mut reader).unwrap();
-
-        let processed = match msg.extract() {
-            openmls::framing::MlsMessageBodyIn::PublicMessage(msg) => self
-                .mls_group
-                .process_message(provider.as_ref(), msg)
-                .unwrap(),
-            openmls::framing::MlsMessageBodyIn::PrivateMessage(msg) => self
-                .mls_group
-                .process_message(provider.as_ref(), msg)
-                .unwrap(),
-            _ => panic!("unexpected message type"),
-        };
-
-        match processed.into_content() {
-            openmls::framing::ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                ("application".to_string(), Some(app_msg.into_bytes()))
-            }
-            openmls::framing::ProcessedMessageContent::ProposalMessage(proposal)
-            | openmls::framing::ProcessedMessageContent::ExternalJoinProposalMessage(proposal) => {
-                self.mls_group
-                    .store_pending_proposal(provider.0.storage(), *proposal)
-                    .unwrap();
-                ("proposal".to_string(), None)
-            }
-            openmls::framing::ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                self.mls_group
-                    .merge_staged_commit(provider.as_mut(), *staged_commit)
-                    .unwrap();
-                ("commit".to_string(), None)
-            }
+        let processed = self.process_message(provider, msg).unwrap();
+        let msg_type = processed.msg_type.clone();
+        let payload = processed.payload.clone();
+        if msg_type == "commit" {
+            self.approve_staged_commit(provider).unwrap();
         }
+        (msg_type, payload)
     }
 
     fn native_merge_pending_commit(&mut self, provider: &mut Provider) {
@@ -741,6 +762,18 @@ impl KeyPackage {
             .map_err(|e| JsError::new(&format!("KeyPackage validation error: {e}")))?;
         Ok(KeyPackage(kp))
     }
+
+    /// Identity bytes from the BasicCredential embedded in the KeyPackage's
+    /// LeafNode. Application uses this to verify the KeyPackage actually belongs
+    /// to the user/device it expects before adding the new member to a group.
+    #[wasm_bindgen]
+    pub fn credential_identity(&self) -> Vec<u8> {
+        self.0
+            .leaf_node()
+            .credential()
+            .serialized_content()
+            .to_vec()
+    }
 }
 
 #[wasm_bindgen]
@@ -766,6 +799,67 @@ fn mls_message_to_uint8array(msg: &MlsMessageOut) -> Uint8Array {
     let mut serialized = vec![];
     msg.tls_serialize(&mut serialized).unwrap();
     unsafe { Uint8Array::new(&Uint8Array::view(&serialized)) }
+}
+
+/// Identity bytes are application-defined; LaraDisco uses UTF-8 "userId:deviceId".
+/// Emit as a plain string when valid UTF-8, otherwise hex-prefixed so the consumer
+/// can detect and reject unexpected formats.
+fn identity_to_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let mut hex = String::with_capacity(bytes.len() * 2 + 4);
+            hex.push_str("hex:");
+            for b in bytes {
+                use std::fmt::Write;
+                let _ = write!(&mut hex, "{:02x}", b);
+            }
+            hex
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StagedCommitInfoJson {
+    added_identities: Vec<String>,
+    removed_indices: Vec<u32>,
+    updated_identities: Vec<String>,
+}
+
+fn staged_commit_info_json(sc: &StagedCommit) -> String {
+    let added_identities = sc
+        .add_proposals()
+        .map(|p| {
+            identity_to_string(
+                p.add_proposal()
+                    .key_package()
+                    .leaf_node()
+                    .credential()
+                    .serialized_content(),
+            )
+        })
+        .collect();
+    let removed_indices = sc
+        .remove_proposals()
+        .map(|p| p.remove_proposal().removed().u32())
+        .collect();
+    let updated_identities = sc
+        .update_proposals()
+        .map(|p| {
+            identity_to_string(
+                p.update_proposal()
+                    .leaf_node()
+                    .credential()
+                    .serialized_content(),
+            )
+        })
+        .collect();
+    let info = StagedCommitInfoJson {
+        added_identities,
+        removed_indices,
+        updated_identities,
+    };
+    serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg(test)]
