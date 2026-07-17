@@ -5,7 +5,7 @@ use openmls::{
     credentials::{BasicCredential, CredentialWithKey},
     framing::{MlsMessageBodyIn, MlsMessageIn, MlsMessageOut},
     group::{GroupId, MlsGroup, MlsGroupJoinConfig, StagedCommit, StagedWelcome},
-    key_packages::KeyPackage as OpenMlsKeyPackage,
+    key_packages::{KeyPackage as OpenMlsKeyPackage, Lifetime},
     prelude::{LeafNodeParameters, SenderRatchetConfiguration, SignatureScheme},
     treesync::RatchetTreeIn,
 };
@@ -30,6 +30,11 @@ const MAX_PAST_EPOCHS: usize = 5;
 
 const PADDING_SIZE: usize = 128;
 
+// Explicit KeyPackage lifetime (seconds) instead of relying on the openmls
+// default. 28 days: long enough that a device's published packages stay valid
+// between sessions, short enough to bound how long a leaked package is usable.
+const KEY_PACKAGE_LIFETIME_SECS: u64 = 28 * 24 * 60 * 60;
+
 #[wasm_bindgen]
 #[derive(Default)]
 pub struct Provider(OpenMlsRustCrypto);
@@ -50,6 +55,8 @@ impl AsMut<OpenMlsRustCrypto> for Provider {
 impl Provider {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
+        #[cfg(feature = "console_error_panic_hook")]
+        console_error_panic_hook::set_once();
         Self::default()
     }
 
@@ -172,6 +179,7 @@ impl Identity {
 
     pub fn key_package(&self, provider: &Provider) -> Result<KeyPackage, JsError> {
         let kp = OpenMlsKeyPackage::builder()
+            .key_package_lifetime(Lifetime::new(KEY_PACKAGE_LIFETIME_SECS))
             .build(
                 CIPHERSUITE,
                 &provider.0,

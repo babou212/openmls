@@ -2662,6 +2662,8 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "openmls_traits",
+ "serde",
+ "serde_json",
  "tls_codec",
  "wasm-bindgen",
  "wasm-bindgen-test",
